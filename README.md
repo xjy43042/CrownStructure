@@ -1,7 +1,7 @@
 # Generating Vegetation Canopy Structure
 
 ## Overview
-This repository contains the processing pipeline for upscaling vegetation canopy structure parameters (crown depth/width/ratio) from site-scale measurements to global 500m resolution dataset, supporting the manuscript:
+This repository contains the processing pipeline for mapping vegetation canopy structure parameters globally (crown depth/width/ratio) from site-scale measurements to global 500 m resolution dataset, supporting the manuscript:
 > "A Global 500 m Resolution Tree Crown Structure Dataset"
 
 ## Code Organization
