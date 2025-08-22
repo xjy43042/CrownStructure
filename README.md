@@ -1,7 +1,7 @@
-# Generating Vegetation Canopy Structure
+# Generating Vegetation Crown Structure
 
 ## Overview
-This repository contains the processing pipeline for mapping vegetation canopy structure parameters (crown depth/width/ratio) from site-scale measurements to a global 500 m resolution dataset, supporting the manuscript:
+This repository contains the processing pipeline for mapping vegetation crown structure parameters (crown depth/width/ratio) from site-scale measurements to a global 500 m resolution dataset, supporting the manuscript:
 > "A Global 500 m Resolution Tree Crown Structure Dataset"
 
 ## Code Organization
@@ -18,7 +18,7 @@ The code is organized into four main functional directories:
    Processes canopy height data from 1 m to 500 m resolution.
 
 4. **Global Prediction** (`Global_Prediction/`)
-   Generates regional predictions at 500m and aggregates to global 0.5° scale.
+   Generates regional predictions at 500m and aggregates to global 0.1° scale.
 
 
 ## Directory Structure
