@@ -32,8 +32,9 @@ The code is organized into four main functional directories:
 │   ├── tif2nc.py                   # GeoTIFF → NetCDF conversion (1 m → 30 m)
 │   └── aggr_CH_500m.F90            # Spatial aggregation (30 m → 500 m)
 └── Global_Prediction/
+    ├── reg_5x5                     # region filenames
     ├── predict_regional.py         # Generate 5°×5° regional crown structure predictions
-    └── aggr_globe.F90              # Aggregate regional predictions to global 0.5° grid
+    └── aggr_globe.F90              # Aggregate regional predictions to global 0.1° grid
 ```
 <br>
 
