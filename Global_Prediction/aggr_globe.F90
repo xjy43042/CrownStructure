@@ -1,226 +1,341 @@
-PROGRAM merge_var
- 
+program aggr_500m_to_0p1deg
 !====================================================================
-! Aggregate regional 5x5° crown structure data (CW/CD/AR) to global 0.5° resolution
-!   Take CHavg-based prediction as example 
-! Usage: 
-!   gfortran -g -mcmodel=large -fbounds-check -o aggr aggr_CWCD_globe.F90 -I/usr/include -lnetcdff -lnetcdf
-! Input:  
-!   5x5° regional NetCDF files
-! Output: 
-!   0.5° global composite
+! Aggregate regional 5x5° crown structure data (CW/CD/AR) 
+! to global 0.1° resolution.
+!
+! Example: Take CH90-based prediction as input.
+!
+! Usage:
+!   gfortran -g -mcmodel=large -fbounds-check -o aggr aggr_CWCD_globe.F90 \
+!            -I/usr/include -lnetcdff -lnetcdf
+!
+! Input:
+!   Regional 5x5° NetCDF tiles (Crown structure + PCT_PFT)
+!
+! Output:
+!   Global 0.1° NetCDF composite
+!
+! Authors:
+!   Jiayi Xiang; Wenzong Dong
 !====================================================================
-USE netcdf
+  use netcdf
+  implicit none
 
-IMPLICIT NONE
+  !=============================
+  ! Parameters
+  !=============================
+  integer, parameter :: r8 = selected_real_kind(12)   ! double precision
+  integer, parameter :: r4 = 4                        ! single precision
 
-! Grid dimensions
-integer , parameter :: nx = 1200 , ny = 1200    ! High-res input grid
-integer , parameter :: nxo= 720, nyo= 360      ! Low-res output grid (0.5 degree)
-integer , parameter :: r8 = selected_real_kind(12)
-real(r8), parameter :: delta = 1./2.           ! Grid spacing
-real(r8), parameter :: reso  = 1./2.           ! Output resolution (0.5 degree)
+  ! Coarse output grid: 0.1° resolution
+  real(r8), parameter :: coarse_delta = 0.1_r8
+  integer, parameter :: nPFT = 8                      ! number of plant functional types
 
-! Data arrays
-real(r8), dimension(1200) :: lat, lon, lats, latn, lonw, lone  ! Grid coordinates
-real(r8), dimension(1200, 1200) :: area, lc                   ! Area and land cover
-real(r8), dimension(1200, 1200, 8) :: CR, CD, AR             ! Crown properties (high-res)
-real(r8), dimension(nxo , nyo, 8) :: CR_, CD_, AR_, wgt       ! Aggregated properties (low-res)
-real(r8), dimension(nyo) :: slat                              ! Output latitude
-real(r8), dimension(nxo) :: slon                               ! Output longitude
+  ! Fine input grid: 500m ≈ 15s (~0.0041667°)
+  integer, parameter :: nx = 1200
+  integer, parameter :: ny = 1200
+  real(r8), parameter :: fine_delta = 1.0_r8 / 240.0_r8
 
-! NetCDF variables
-integer :: ncid, lat_id, lon_id, CR_id, CD_id, AR_id, lc_id
-integer :: lat_dimid, lon_dimid, lc_dimid
+  real(r8), parameter :: missing_value = -999.0_r8
+  real(r8), parameter :: lat_max =  90.0_r8
+  real(r8), parameter :: lat_min = -90.0_r8
+  real(r8), parameter :: lon_min = -180.0_r8
+  real(r8), parameter :: lon_max =  180.0_r8
 
-! Loop and index variables
-integer :: i, j, ix, iy, io, jo, ilc
-integer :: ei, ej, si, sj, imon, argn
-integer :: reglat,reglon,reglon_,sreglat,sreglon,ereglat,ereglon
-integer :: XY3D(3), reg(4)
+  ! Mathematical constants
+  real(r8) :: pi, deg2rad, re
 
-! File handling variables
-character(len=256) :: reg1, reg2, reg3, reg4
-character(len=256) :: iyear, cmon, lndname
-REAL(r8) :: dx, dy, deg2rad, pi, re
-logical  :: fileExists
+  ! Derived global coarse grid size
+  integer :: nlon, nlat, XY3D(3)
 
-! Region boundaries (global)
-sreglat =   90
-ereglat =  -90
-sreglon = -180
-ereglon =  180
+  !=============================
+  ! Arrays
+  !=============================
+  ! Accumulators (lon, lat, PFT)
+  real(r8), allocatable :: CW_accum(:,:,:), CD_accum(:,:,:), AR_accum(:,:,:)
+  real(r8), allocatable :: weight_sum(:,:,:), pct_f(:,:,:)
 
-! Get year from command line if provided
-argn = IARGC()
-IF (argn > 0) THEN
-    CALL getarg(1, iyear)
-ENDIF
+  ! Fine grid buffers
+  real(r8), allocatable :: lat_fine(:), lon_fine(:), area_fine(:,:)
+  real(r8), allocatable :: CW(:,:,:), CD(:,:,:), AR(:,:,:)
 
-! Constants for coordinate calculations
-pi = 4._r8*atan(1.)
-deg2rad = pi/180._r8
-re = 6.37122e6 * 0.001 ! Earth radius (km -> m)
+  ! Coarse grid coordinates
+  real(r8), allocatable :: lon_c(:), lat_c(:)
 
-! Main processing loop over 5x5 degree regions
-DO reglat = sreglat, ereglat, -5
-    DO reglon_ = sreglon, ereglon, 5
+  !=============================
+  ! Loop & I/O
+  !=============================
+  integer :: i, j, i_fine_lon, j_fine_lat, pft_idx, pft_pct_idx
+  integer :: ncid, lat_id, lon_id, CW_id, CD_id, AR_id, pct_id, ncid1
+  integer :: ncout, lon_dim_out, lat_dim_out, pft_dim_out
+  integer :: lon_varid, lat_varid, cr_varid, cd_varid, ar_varid
+  integer :: status
+  character(len=256) :: filename, pctname, outfile
+  logical :: fileExists, pctExists
 
-       ! Handle longitude wrapping
-       reglon = reglon_
-       IF (reglon_ > 180) reglon = reglon_ - 360
-       
-       ! Define current region boundaries
-       reg(1) = reglat      ! North
-       reg(2) = reglon      ! West 
-       reg(3) = reglat - 5  ! South
-       reg(4) = reglon + 5  ! East
+  ! Indices & temporaries
+  integer :: i_coarse_lon, j_coarse_lat
+  real(r8) :: lonval, latval
+  real(r8) :: lon_west, lon_east, lat_south, lat_north
 
-       ! Create region identifier strings
-       write(reg1, "(i4)") reg(1)
-       write(reg2, "(i4)") reg(2)
-       write(reg3, "(i4)") reg(3)
-       write(reg4, "(i4)") reg(4)
+  ! Regional definition file
+  integer :: reg(4), iostatus
+  character(len=256) :: REGFILE
+  character(len=20) :: reg1, reg2, reg3, reg4
 
-       ! Initialize arrays
-       CR(:,:,:) = 0.
-       CD(:,:,:) = 0.
-       AR(:,:,:) = 0.
-       
-       ! Build input filename
-       lndname = '/tera10/yuanhua/xiangjy/factors_new/make/output/CH90/' // &
-                  'RG_' // trim(adjustL(reg1)) // '_' // trim(adjustL(reg2)) // '_' // &
-                  trim(adjustL(reg3)) // '_' //trim(adjustL(reg4)) // '.CanopyStructure_15s_CH90.nc'
-                  
-       ! Check if file exists
-       inquire (file=lndname, exist=fileExists)
+  !=============================
+  ! Initialize constants
+  !=============================
+  pi      = 4.0_r8 * atan(1.0_r8)
+  deg2rad = pi / 180.0_r8
+  re      = 6.37122e6_r8   ! Earth radius (m)
 
-       IF (fileExists) THEN
-          print*, 'Processing '//trim(lndname)
+  !=============================
+  ! Define coarse grid
+  !=============================
+  nlon = int((lon_max - lon_min) / coarse_delta + 0.5_r8)
+  nlat = int((lat_max - lat_min) / coarse_delta + 0.5_r8)
 
-          ! Open and read NetCDF file
-          CALL nccheck( nf90_open(trim(lndname), nf90_nowrite, ncid) )
-          CALL nccheck( nf90_inq_varid(ncid, "CROWN_WIDTH" , CR_id) )
-          CALL nccheck( nf90_get_var  (ncid, CR_id, CR   ) )
-          CALL nccheck( nf90_inq_varid(ncid, "CROWN_DEPTH" , CD_id) )
-          CALL nccheck( nf90_get_var  (ncid, CD_id, CD   ) )
-          CALL nccheck( nf90_inq_varid(ncid, "ASPECT_RATIO" , AR_id) )
-          CALL nccheck( nf90_get_var  (ncid, AR_id, AR   ) )
-          CALL nccheck( nf90_inq_varid(ncid, "lat" , lat_id) )
-          CALL nccheck( nf90_get_var  (ncid, lat_id, lat   ) )
-          CALL nccheck( nf90_inq_varid(ncid, "lon" , lon_id) )
-          CALL nccheck( nf90_get_var  (ncid, lon_id, lon   ) )
-          CALL nccheck( nf90_close(ncid) )
+  allocate(lon_c(nlon), lat_c(nlat))
+  do i = 1, nlon
+     lon_c(i) = lon_min + (real(i,r8) - 0.5_r8) * coarse_delta
+  end do
+  do j = 1, nlat
+     lat_c(j) = lat_max - (real(j,r8) - 0.5_r8) * coarse_delta
+  end do
 
-          ! Calculate grid cell boundaries
-          latn(:) = lat(:) + delta/2
-          lats(:) = lat(:) - delta/2
-          lonw(:) = lon(:) - delta/2
-          lone(:) = lon(:) + delta/2
+  print *, "Coarse grid lon range=", lon_c(1), lon_c(nlon)
+  print *, "Coarse grid lat range=", lat_c(1), lat_c(nlat)
 
-          ! Calculate grid cell areas (m²)
-          DO i = 1, ny
-             dx = (lone(1)-lonw(1))*deg2rad
-             dy = sin(latn(i)*deg2rad) - sin(lats(i)*deg2rad)
-             area(:,i) = dx*dy*re*re
-          ENDDO
+  !=============================
+  ! Allocate accumulators
+  !=============================
+  allocate(CW_accum(nlon,nlat,nPFT))
+  allocate(CD_accum(nlon,nlat,nPFT))
+  allocate(AR_accum(nlon,nlat,nPFT))
+  allocate(weight_sum(nlon,nlat,nPFT))
+  CW_accum = 0.0_r8; CD_accum = 0.0_r8; AR_accum = 0.0_r8; weight_sum = 0.0_r8
 
-          ! Aggregate high-res data to low-res grid
-          DO ix = 1, nx
-             DO iy = 1, ny
-                ! Find output grid indices
-                jo = NINT((90.-lat(iy))/reso+0.5)
-                io = NINT((lon(ix)+180.)/reso+0.5)
-                
-                ! Store aggregated values
-                CR_(io,jo,:) = CR(ix,iy,:)
-                CD_(io,jo,:) = CD(ix,iy,:)
-                AR_(io,jo,:) = AR(ix,iy,:)
-             ENDDO
-          ENDDO
-       ENDIF
-    ENDDO
-ENDDO
+  ! Fine grid buffers
+  allocate(lat_fine(ny), lon_fine(nx))
+  allocate(area_fine(nx,ny))
+  allocate(CW(nx,ny,nPFT), CD(nx,ny,nPFT), AR(nx,ny,nPFT), pct_f(nx,ny,16))
 
-! Create output latitude/longitude coordinates
-DO ix = 1, nyo
-    slat(ix) = 90 - reso*(ix-1) - reso/2
-ENDDO
-DO iy = 1, nxo
-    slon(iy) = -180 + reso*(iy-1) + reso/2
-ENDDO
+  !=============================
+  ! Open region definition file
+  !=============================
+  REGFILE = "/tera10/yuanhua/xiangjy/factors_new/make/aggr/final/reg_5x5"
+  open(unit=11, file=REGFILE, form="formatted", status="old", action="read")
 
-! Create output NetCDF file
-lndname = '/tera10/yuanhua/xiangjy/factors_new/make/aggr/Global_CanopyStructure_0.5deg_CH90.nc'
-print*, 'Making Global Data'
+  !=============================
+  ! Loop through regional tiles
+  !=============================
+  do
+     read(11, *, iostat=iostatus) reg
+     if (iostatus /= 0) exit  ! EOF
 
-CALL nccheck( nf90_create (trim(lndname), NF90_NETCDF4, ncid) )
+     ! Convert integers to strings
+     write(reg1,"(i4)") reg(1)
+     write(reg2,"(i4)") reg(2)
+     write(reg3,"(i4)") reg(3)
+     write(reg4,"(i4)") reg(4)
 
-! Define dimensions
-CALL nccheck( nf90_def_dim(ncid, "PFT", 8, lc_dimid) )
-CALL nccheck( nf90_def_dim(ncid, "lat", nyo, lat_dimid) )
-CALL nccheck( nf90_def_dim(ncid, "lon", nxo, lon_dimid) )
+     !-----------------------------------
+     ! Load PCT_PFT file
+     !-----------------------------------
+     write(pctname,'(A,A,"_",A,"_",A,"_",A,".MOD2020.nc")') &
+          '/tera10/yuanhua/xiangjy/factors_new/rawdata/PFTLAI_5x5/RG_', &
+          trim(adjustL(reg1)), trim(adjustL(reg2)), trim(adjustL(reg3)), trim(adjustL(reg4))
 
-! Define coordinate variables
-CALL nccheck( nf90_def_var(ncid, "lat", NF90_DOUBLE, lat_dimid, lat_id, deflate_level=6) )
-CALL nccheck( nf90_put_att(ncid, lat_id, "long_name", "Latitude") )
-CALL nccheck( nf90_put_att(ncid, lat_id, "units", "degrees_north") )
+     inquire(file=trim(pctname), exist=pctExists)
+     if (.not. pctExists) then
+        print *, 'PCT_PFT file does not exist: ', trim(pctname)
+        cycle
+     else
+        print *, 'Loading PCT_PFT file: ', pctname
+     end if
 
-CALL nccheck( nf90_def_var(ncid, "lon", NF90_DOUBLE, lon_dimid, lon_id, deflate_level=6) )
-CALL nccheck( nf90_put_att(ncid, lon_id, "long_name", "Longitude") )
-CALL nccheck( nf90_put_att(ncid, lon_id, "units", "degrees_east") )
+     call nccheck(nf90_open(pctname, NF90_NOWRITE, ncid1))
+     call nccheck(nf90_inq_varid(ncid1, 'PCT_PFT', pct_id))
+     call nccheck(nf90_get_var  (ncid1, pct_id, pct_f))
+     call nccheck(nf90_close(ncid1))
 
-! Define 3D data variables
-XY3D = (/lon_dimid, lat_dimid, lc_dimid/)
+     !-----------------------------------
+     ! Load CW/CD/AR canopy structure file
+     !-----------------------------------
+     write(filename,'(A,A,"_",A,"_",A,"_",A,".CanopyStructure_15s_CH90.nc")') &
+          '/tera10/yuanhua/xiangjy/factors_new/make/PreRegion/output/RG_', &
+          trim(adjustL(reg1)), trim(adjustL(reg2)), trim(adjustL(reg3)), trim(adjustL(reg4))
 
-! Crown width
-CALL nccheck( nf90_def_var(ncid, "CROWN_WIDTH", NF90_DOUBLE, XY3D, CR_id, deflate_level=6) )
-CALL nccheck( nf90_put_att(ncid, CR_id, "long_name", "crown width predicted by the average canopy-top height") )
-CALL nccheck( nf90_put_att(ncid, CR_id, "units", "m") )
-CALL nccheck( nf90_put_att(ncid, CR_id, "_FillValue", -999._r8) )
+     inquire(file=trim(filename), exist=fileExists)
+     if (fileExists) print *, 'Loading CWCD file: ', filename
 
-! Crown depth
-CALL nccheck( nf90_def_var(ncid, "CROWN_DEPTH", NF90_DOUBLE, XY3D, CD_id, deflate_level=6) )
-CALL nccheck( nf90_put_att(ncid, CD_id, "long_name", "crown depth predicted by the average canopy-top height") )
-CALL nccheck( nf90_put_att(ncid, CD_id, "units", "m") )
-CALL nccheck( nf90_put_att(ncid, CD_id, "_FillValue", -999._r8) )
+     call nccheck(nf90_open(trim(filename), NF90_NOWRITE, ncid))
+     call nccheck(nf90_inq_varid(ncid,'lat',lat_id)); call nccheck(nf90_get_var(ncid, lat_id, lat_fine))
+     call nccheck(nf90_inq_varid(ncid,'lon',lon_id)); call nccheck(nf90_get_var(ncid, lon_id, lon_fine))
 
-! Aspect ratio
-CALL nccheck( nf90_def_var(ncid, "ASPECT_RATIO", NF90_DOUBLE, XY3D, AR_id, deflate_level=6) )
-CALL nccheck( nf90_put_att(ncid, AR_id, "long_name", "crown depth to width ratio predicted by the average canopy-top height") )
-CALL nccheck( nf90_put_att(ncid, AR_id, "units", "None") )
-CALL nccheck( nf90_put_att(ncid, AR_id, "_FillValue", -999._r8) )
+     call nccheck(nf90_inq_varid(ncid,'CROWN_WIDTH' , CW_id)); call nccheck(nf90_get_var(ncid, CW_id, CW))
+     call nccheck(nf90_inq_varid(ncid,'CROWN_DEPTH' , CD_id)); call nccheck(nf90_get_var(ncid, CD_id, CD))
+     call nccheck(nf90_inq_varid(ncid,'ASPECT_RATIO', AR_id)); call nccheck(nf90_get_var(ncid, AR_id, AR))
 
-! Write data to file
-CALL nccheck( nf90_inq_varid(ncid, "lat", lat_id) )
-CALL nccheck( nf90_put_var(ncid, lat_id, slat) )
-CALL nccheck( nf90_inq_varid(ncid, "lon", lon_id) )
-CALL nccheck( nf90_put_var(ncid, lon_id, slon) )
-CALL nccheck( nf90_inq_varid(ncid, "CROWN_WIDTH", CR_id) )
-CALL nccheck( nf90_put_var(ncid, CR_id, CR_) )
-CALL nccheck( nf90_inq_varid(ncid, "CROWN_DEPTH", CD_id) )
-CALL nccheck( nf90_put_var(ncid, CD_id, CD_) )
-CALL nccheck( nf90_inq_varid(ncid, "ASPECT_RATIO", AR_id) )
-CALL nccheck( nf90_put_var(ncid, AR_id, AR_) )
+     !-----------------------------------
+     ! Compute fine-cell area (spherical)
+     !-----------------------------------
+     do i_fine_lon = 1, nx
+        lon_west = lon_fine(i_fine_lon) - 0.5_r8 * fine_delta
+        lon_east = lon_fine(i_fine_lon) + 0.5_r8 * fine_delta
+        do j_fine_lat = 1, ny
+           lat_south = lat_fine(j_fine_lat) - 0.5_r8 * fine_delta
+           lat_north = lat_fine(j_fine_lat) + 0.5_r8 * fine_delta
+           area_fine(i_fine_lon,j_fine_lat) = (lon_east-lon_west)*deg2rad * &
+                                              (sin(lat_north*deg2rad)-sin(lat_south*deg2rad)) * re*re
+        end do
+     end do
 
-! Add global attributes
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'Title', 'Land surface model input canopy morphological structure data') )
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'resolution', '0.5 degree, 720x360 (lonxlat) global') )
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'coordinate', 'Geographic, degrees longitude and latitude') )
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'Authors', 'Yongjiu Dai land group at Sun Yat-sen University') )
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'Address', 'School of Atmospheric Sciences, Sun Yat-sen University, Zhuhai, China') )
-CALL nccheck( nf90_put_att(ncid, NF90_GLOBAL, 'Contact', 'Jiayi Xiang (xiangjy8@mail2.sysu.edu.cn), Hua Yuan (yuanh25@mail.sysu.edu.cn)') )
+     !-----------------------------------
+     ! Accumulate to regional coarse grid
+     !-----------------------------------
+     do i_fine_lon = 1, nx
+        lonval = lon_fine(i_fine_lon)
+        i_coarse_lon = int( floor( (lonval - lon_min)/coarse_delta ) ) + 1
+        if (i_coarse_lon < 1 .or. i_coarse_lon > nlon) cycle
+        do j_fine_lat = 1, ny
+           latval = lat_fine(j_fine_lat)
+           j_coarse_lat = int( floor( (lat_max - latval)/coarse_delta ) ) + 1
+           if (j_coarse_lat < 1 .or. j_coarse_lat > nlat) cycle
 
-CALL nccheck( nf90_close(ncid) )
-print*, 'Successfully created '//trim(lndname)//'!'
+           do pft_idx = 1, nPFT
+              pft_pct_idx = pft_idx + 1  ! pct_f indexing (skip first column)
+              if (pct_f(i_fine_lon,j_fine_lat,pft_pct_idx) < 0.01_r8) cycle
+              if (.not. is_valid(CW(i_fine_lon,j_fine_lat,pft_idx))) cycle
+              if (.not. is_valid(CD(i_fine_lon,j_fine_lat,pft_idx))) cycle
+              if (.not. is_valid(AR(i_fine_lon,j_fine_lat,pft_idx))) cycle
 
-CONTAINS
-  ! NetCDF error handling subroutine
-  SUBROUTINE nccheck(status)
-      INTEGER, INTENT(IN) :: status
-      IF (status /= nf90_noerr) THEN
-         print *, trim(nf90_strerror(status))
-         stop 2
-      END IF
-   END SUBROUTINE nccheck
-END PROGRAM merge_var
+              CW_accum(i_coarse_lon,j_coarse_lat,pft_idx) = CW_accum(i_coarse_lon,j_coarse_lat,pft_idx) + &
+                     CW(i_fine_lon,j_fine_lat,pft_idx) * area_fine(i_fine_lon,j_fine_lat) * pct_f(i_fine_lon,j_fine_lat,pft_pct_idx)
+              CD_accum(i_coarse_lon,j_coarse_lat,pft_idx) = CD_accum(i_coarse_lon,j_coarse_lat,pft_idx) + &
+                     CD(i_fine_lon,j_fine_lat,pft_idx) * area_fine(i_fine_lon,j_fine_lat) * pct_f(i_fine_lon,j_fine_lat,pft_pct_idx)
+              AR_accum(i_coarse_lon,j_coarse_lat,pft_idx) = AR_accum(i_coarse_lon,j_coarse_lat,pft_idx) + &
+                     AR(i_fine_lon,j_fine_lat,pft_idx) * area_fine(i_fine_lon,j_fine_lat) * pct_f(i_fine_lon,j_fine_lat,pft_pct_idx)
+              weight_sum(i_coarse_lon,j_coarse_lat,pft_idx) = weight_sum(i_coarse_lon,j_coarse_lat,pft_idx) + &
+                     area_fine(i_fine_lon,j_fine_lat) * pct_f(i_fine_lon,j_fine_lat,pft_pct_idx)
+           end do
+        end do
+     end do
+
+     call nccheck(nf90_close(ncid))
+  end do  ! end of region loop
+
+  !=============================
+  ! Normalize accumulators (pct-area-weighted mean)
+  !=============================
+  do i = 1, nlon
+     do j = 1, nlat
+        do pft_idx = 1, nPFT
+           if (weight_sum(i,j,pft_idx) > 0.0_r8) then
+              CW_accum(i,j,pft_idx) = CW_accum(i,j,pft_idx) / weight_sum(i,j,pft_idx)
+              CD_accum(i,j,pft_idx) = CD_accum(i,j,pft_idx) / weight_sum(i,j,pft_idx)
+              AR_accum(i,j,pft_idx) = AR_accum(i,j,pft_idx) / weight_sum(i,j,pft_idx)
+           else
+              CW_accum(i,j,pft_idx) = missing_value
+              CD_accum(i,j,pft_idx) = missing_value
+              AR_accum(i,j,pft_idx) = missing_value
+           end if
+        end do
+     end do
+  end do
+
+  !=============================
+  ! Write output global NetCDF
+  !=============================
+  outfile = '/tera10/yuanhua/xiangjy/factors_new/make/aggr/final/output/Global_CrownStructure_0.1deg_CH90.nc'
+  print*, 'Creating global output: ', trim(outfile)
+
+  call nccheck(nf90_create(trim(outfile), NF90_NETCDF4, ncout))
+  call nccheck(nf90_def_dim(ncout, 'lon', nlon, lon_dim_out))
+  call nccheck(nf90_def_dim(ncout, 'lat', nlat, lat_dim_out))
+  call nccheck(nf90_def_dim(ncout, 'PFT', nPFT, pft_dim_out))
+
+  call nccheck(nf90_def_var(ncout, 'lon', NF90_DOUBLE, (/lon_dim_out/), lon_varid, deflate_level=9))
+  call nccheck(nf90_put_att(ncout, lon_varid, 'long_name', 'Longitude'))
+  call nccheck(nf90_put_att(ncout, lon_varid, 'units', 'degrees_east'))
+
+  call nccheck(nf90_def_var(ncout, 'lat', NF90_DOUBLE, (/lat_dim_out/), lat_varid, deflate_level=9))
+  call nccheck(nf90_put_att(ncout, lat_varid, 'long_name', 'Latitude'))
+  call nccheck(nf90_put_att(ncout, lat_varid, 'units', 'degrees_north'))
+
+  XY3D = (/lon_dim_out,lat_dim_out,pft_dim_out/)
+  call nccheck(nf90_def_var(ncout, 'CROWN_WIDTH', NF90_FLOAT, XY3D, cr_varid, deflate_level=9))
+  call nccheck(nf90_put_att(ncout, cr_varid, '_FillValue', real(missing_value,r4)))
+  call nccheck(nf90_put_att(ncout, cr_varid, 'long_name', 'crown width predicted by & 
+  the 90th percentile canopy-top height'))
+  call nccheck(nf90_put_att(ncout, cr_varid, 'units','m'))
+
+  call nccheck(nf90_def_var(ncout, 'CROWN_DEPTH', NF90_FLOAT, XY3D, cd_varid, deflate_level=9))
+  call nccheck(nf90_put_att(ncout, cd_varid, '_FillValue', real(missing_value,r4)))
+  call nccheck(nf90_put_att(ncout, cd_varid, 'long_name', 'crown depth predicted by & 
+  the 90th percentile canopy-top height'))
+  call nccheck(nf90_put_att(ncout, cd_varid, 'units','m'))
+
+  call nccheck(nf90_def_var(ncout, 'ASPECT_RATIO', NF90_FLOAT, XY3D, ar_varid, deflate_level=9))
+  call nccheck(nf90_put_att(ncout, ar_varid, '_FillValue', real(missing_value,r4)))
+  call nccheck(nf90_put_att(ncout, ar_varid, 'long_name', 'crown depth to width ratio & 
+  predicted by the 90th percentile canopy-top height'))
+
+  call nccheck(nf90_enddef(ncout))
+
+  call nccheck(nf90_put_var(ncout, lon_varid, lon_c))
+  call nccheck(nf90_put_var(ncout, lat_varid, lat_c))
+  call nccheck(nf90_put_var(ncout, cr_varid, real(CW_accum,r4)))
+  call nccheck(nf90_put_var(ncout, cd_varid, real(CD_accum,r4)))
+  call nccheck(nf90_put_var(ncout, ar_varid, real(AR_accum,r4)))
+
+  ! Global attributes
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'Title',      'Land surface model input crown morphological structure data'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'resolution', '0.1 degree, 3600x1800 (lon x lat) global'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'coordinate', 'Geographic, degrees longitude and latitude'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'source',     'CanopyStructure_15s_CH90 tiles (500m)'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'Authors',    'Yongjiu Dai land group at Sun Yat-sen University'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'Address',    'School of Atmospheric Sciences, & 
+  Sun Yat-sen University, Zhuhai, China'))
+  call nccheck(nf90_put_att(ncout, NF90_GLOBAL, 'Contact',    'Jiayi Xiang (xiangjy8@mail2.sysu.edu.cn), & 
+  Hua Yuan (yuanh25@mail.sysu.edu.cn)'))
+
+  call nccheck(nf90_close(ncout))
+  print*, 'Successfully created '//trim(outfile)//'!'
+
+  !=============================
+  ! Cleanup
+  !=============================
+  if (allocated(CW_accum))  deallocate(CW_accum)
+  if (allocated(CD_accum))  deallocate(CD_accum)
+  if (allocated(AR_accum))  deallocate(AR_accum)
+  if (allocated(weight_sum)) deallocate(weight_sum)
+  if (allocated(lon_c))     deallocate(lon_c)
+  if (allocated(lat_c))     deallocate(lat_c)
+  if (allocated(lat_fine))  deallocate(lat_fine)
+  if (allocated(lon_fine))  deallocate(lon_fine)
+  if (allocated(area_fine)) deallocate(area_fine)
+  if (allocated(CW))        deallocate(CW)
+  if (allocated(CD))        deallocate(CD)
+  if (allocated(AR))        deallocate(AR)
+
+contains
+
+  !-----------------------------
+  subroutine nccheck(status)
+    integer, intent(in) :: status
+    if (status /= nf90_noerr) then
+       write(*,*) 'NetCDF error: ', trim(nf90_strerror(status))
+       stop 2
+    end if
+  end subroutine nccheck
+
+  !-----------------------------
+  logical function is_valid(x)
+    use, intrinsic :: ieee_arithmetic
+    real(r8), intent(in) :: x
+    is_valid = (.not. ieee_is_nan(x)) .and. (abs(x - missing_value) > 1.0e-6_r8)
+  end function is_valid
+
+end program aggr_500m_to_0p1deg
