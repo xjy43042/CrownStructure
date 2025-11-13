@@ -42,3 +42,4 @@ The code is organized into four main functional directories:
 Code is primarily written in Python 3.6+ with dependencies including sklearn, flaml, numpy, pandas, xarray and matplotlib.
 
 High-performance spatial aggregation is achieved through ​​Fortran 90+​​ implementations compiled with NetCDF library support.
+https://doi.org/10.5281/zenodo.17600667
