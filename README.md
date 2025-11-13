@@ -1,4 +1,4 @@
-# Generating Vegetation Crown Structure
+# Generating Tree Crown Structure
 
 ## Overview
 This repository contains the processing pipeline for mapping vegetation crown structure parameters (crown depth/width/ratio) from site-scale measurements to a global 500 m resolution dataset, supporting the manuscript:
