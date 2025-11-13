@@ -2,7 +2,7 @@
 
 ## Overview
 This repository contains the processing pipeline for mapping vegetation crown structure parameters (crown depth/width/ratio) from site-scale measurements to a global 500 m resolution dataset, supporting the manuscript:
-> "A Global 500 m Resolution Tree Crown Structure Dataset"
+> "A Global 500 m Dataset of Tree Crown Morphology to Advance Vegetation Modeling and Management"
 
 ## Code Organization
 
